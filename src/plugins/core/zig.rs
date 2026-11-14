@@ -352,6 +352,51 @@ impl ZigPlugin {
         mirrors.shuffle(&mut rng);
         Some(mirrors)
     }
+
+    async fn resolve_lock_info_from_index(
+        &self,
+        json_url: &str,
+        tv: &ToolVersion,
+        target: &PlatformTarget,
+    ) -> Result<PlatformInfo> {
+        let (arch, os) = Self::index_platform(target);
+        let version = tv.version.as_str();
+
+        // ZigPlugin::download() unconditionally verifies minisign for every archive,
+        // so record minisign provenance at lock time to match install_version_ and
+        // preserve the provenance ratchet across `mise lock --bump`.
+        match self
+            .get_download_info_from_json(json_url, version, arch, os)
+            .await
+        {
+            Ok((url, checksum, size)) => Ok(PlatformInfo {
+                url: Some(url),
+                checksum,
+                size,
+                provenance: Some(ProvenanceType::Minisign),
+                ..Default::default()
+            }),
+            Err(err) if regex!(r"^\d+\.\d+\.\d+$").is_match(&tv.version) => {
+                // Fallback: construct URL directly for numbered versions (no checksum available)
+                warn!("zig: {err:#}; locking the {version} URL without a checksum");
+                Ok(PlatformInfo {
+                    url: Some(Self::release_tarball_url(arch, os, &tv.version)),
+                    provenance: Some(ProvenanceType::Minisign),
+                    ..Default::default()
+                })
+            }
+            Err(_) if tv.version.contains("-dev.") => {
+                // Resolved from a rolling channel (e.g. "master"): nightly lives
+                // under /builds/, no checksum (minisign verifies at install). (#10251)
+                Ok(PlatformInfo {
+                    url: Some(Self::nightly_tarball_url(arch, os, &tv.version)),
+                    provenance: Some(ProvenanceType::Minisign),
+                    ..Default::default()
+                })
+            }
+            Err(_) => Ok(PlatformInfo::default()),
+        }
+    }
 }
 
 #[async_trait]
@@ -554,53 +599,14 @@ impl Backend for ZigPlugin {
         tv: &ToolVersion,
         target: &PlatformTarget,
     ) -> Result<PlatformInfo> {
-        let indexes = HashMap::from([
-            ("zig", "https://ziglang.org/download/index.json"),
-            ("mach", "https://machengine.org/zig/index.json"),
-        ]);
-
-        let (arch, os) = Self::index_platform(target);
-
-        let (json_url, version) = if regex!(r"^mach-|-mach$").is_match(&tv.version) {
-            (indexes["mach"], tv.version.as_str())
+        let json_url = if regex!(r"^mach-|-mach$").is_match(&tv.version) {
+            "https://machengine.org/zig/index.json"
         } else {
-            (indexes["zig"], tv.version.as_str())
+            "https://ziglang.org/download/index.json"
         };
 
-        // Try to get full info from JSON (includes checksum and size)
-        // Don't pre-set provenance at lock time — minisign verification hasn't run yet.
-        // Provenance is recorded in install_version_ after download() confirms minisign
-        // verification succeeded.
-        match self
-            .get_download_info_from_json(json_url, version, arch, os)
+        self.resolve_lock_info_from_index(json_url, tv, target)
             .await
-        {
-            Ok((url, checksum, size)) => Ok(PlatformInfo {
-                url: Some(url),
-                checksum,
-                size,
-                ..Default::default()
-            }),
-            Err(err) if regex!(r"^\d+\.\d+\.\d+$").is_match(&tv.version) => {
-                // Fallback: construct URL directly for numbered versions (no checksum available)
-                // Don't pre-set provenance here — record it only after download() confirms
-                // minisign verification succeeded during install
-                warn!("zig: {err:#}; locking the {version} URL without a checksum");
-                Ok(PlatformInfo {
-                    url: Some(Self::release_tarball_url(arch, os, &tv.version)),
-                    ..Default::default()
-                })
-            }
-            Err(_) if tv.version.contains("-dev.") => {
-                // Resolved from a rolling channel (e.g. "master"): nightly lives
-                // under /builds/, no checksum (minisign verifies at install). (#10251)
-                Ok(PlatformInfo {
-                    url: Some(Self::nightly_tarball_url(arch, os, &tv.version)),
-                    ..Default::default()
-                })
-            }
-            Err(_) => Ok(PlatformInfo::default()),
-        }
     }
 }
 
@@ -653,5 +659,99 @@ mod tests {
         assert!(!usable(old_fallback, "0.17.0", "x86_64", "linux"));
         let old_windows = "https://ziglang.org/download/0.13.0/zig-windows-x86_64-0.13.0.tar.xz";
         assert!(!usable(old_windows, "0.13.0", "x86_64", "windows"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_lock_info_records_minisign_provenance() {
+        use crate::args::BackendArg;
+        use crate::backend::platform_target::PlatformTarget;
+        use crate::lockfile::ProvenanceType;
+        use crate::platform::Platform;
+        use crate::toolset::{ToolRequest, ToolVersion};
+        use std::sync::Arc;
+
+        let mut server = mockito::Server::new_async().await;
+        let index_body = serde_json::json!({
+            "0.17.1": {
+                "aarch64-macos": {
+                    "tarball": "https://ziglang.org/download/0.17.1/zig-aarch64-macos-0.17.1.tar.xz",
+                    "shasum": "75f1bc7a0000000000000000000000000000000000000000000000000000dd8d",
+                    "size": "123456"
+                }
+            }
+        });
+        let _ok = server
+            .mock("GET", "/ok.json")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(index_body.to_string())
+            .create_async()
+            .await;
+        let _err = server
+            .mock("GET", "/err.json")
+            .with_status(500)
+            .create_async()
+            .await;
+
+        let plugin = ZigPlugin::new();
+        let target = PlatformTarget::new(Platform::parse("macos-arm64").unwrap());
+        let ba = Arc::new(BackendArg::from("zig"));
+        let make_tv = |version: &str| {
+            let req = ToolRequest::new(ba.clone(), version, Default::default()).unwrap();
+            ToolVersion::new(req, version.to_string())
+        };
+
+        let from_index = plugin
+            .resolve_lock_info_from_index(
+                &format!("{}/ok.json", server.url()),
+                &make_tv("0.17.1"),
+                &target,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            from_index.url.as_deref(),
+            Some("https://ziglang.org/download/0.17.1/zig-aarch64-macos-0.17.1.tar.xz")
+        );
+        assert_eq!(from_index.provenance, Some(ProvenanceType::Minisign));
+
+        let from_fallback = plugin
+            .resolve_lock_info_from_index(
+                &format!("{}/err.json", server.url()),
+                &make_tv("0.17.1"),
+                &target,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            from_fallback.url.as_deref(),
+            Some("https://ziglang.org/download/0.17.1/zig-aarch64-macos-0.17.1.tar.xz")
+        );
+        assert_eq!(from_fallback.provenance, Some(ProvenanceType::Minisign));
+
+        let from_nightly = plugin
+            .resolve_lock_info_from_index(
+                &format!("{}/err.json", server.url()),
+                &make_tv("0.17.0-dev.1+abc"),
+                &target,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            from_nightly.url.as_deref(),
+            Some("https://ziglang.org/builds/zig-aarch64-macos-0.17.0-dev.1+abc.tar.xz")
+        );
+        assert_eq!(from_nightly.provenance, Some(ProvenanceType::Minisign));
+
+        let unresolvable = plugin
+            .resolve_lock_info_from_index(
+                &format!("{}/err.json", server.url()),
+                &make_tv("not-a-version"),
+                &target,
+            )
+            .await
+            .unwrap();
+        assert_eq!(unresolvable.url, None);
+        assert_eq!(unresolvable.provenance, None);
     }
 }
